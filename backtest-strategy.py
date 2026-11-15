@@ -166,8 +166,8 @@ def main():
         print("\n=== Return % by calendar year (each year traded independently) ===")
         with pd.option_context("display.float_format", "{:8.1f}".format, "display.width", 200):
             print(pd.DataFrame(out).to_string())
-    print("\nFills at next open, cost per side included. Past results do not predict future "
-          "results. Not financial advice.")
+    print(f"\nFills at next open, cost per side {args.cost*100:.2f}%. Past results do not predict "
+          "future results. Not financial advice.")
 
 
 if __name__ == "__main__":
