@@ -20,6 +20,9 @@ Commands (New York time, Mon-Fri):
                               without a fresh quote the limit IS that floor, which
                               still fills at the best bid above it
   sell-open  ~09:20           cancel unfilled pre-market sell, market-on-open sell
+  compare    ~09:50 .. 10:10  record today's actual sell fill vs the official 09:30 open
+                              in overnight-trader-compare.csv (once per day)
+  report                      summarise overnight-trader-compare.csv (no API keys needed)
   cancel                      cancel all open orders for the symbol
 
 Safety:
@@ -37,6 +40,7 @@ This is an experiment, not financial advice. You can lose money.
 """
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -51,7 +55,11 @@ LIVE_URL = "https://api.alpaca.markets"
 DATA_URL = "https://data.alpaca.markets"
 NY = ZoneInfo("America/New_York")
 MAX_QUOTE_AGE_MIN = 15
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "overnight-trader-log.jsonl")
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(HERE, "overnight-trader-log.jsonl")
+COMPARE_FILE = os.path.join(HERE, "overnight-trader-compare.csv")
+COMPARE_FIELDS = ["date", "exit_kind", "qty", "entry_px", "sell_px", "sell_time_ny", "open_px",
+                  "ret_actual_pct", "ret_if_open_pct", "diff_pct", "diff_usd"]
 
 
 # ------------------------------------------------------------------ helpers
@@ -204,7 +212,7 @@ def cmd_buy(api, a):
     if qty < 1:
         return log("skip_buy", reason=f"max_usd {a.max_usd} < price {price}")
     order = {"symbol": a.symbol, "qty": str(qty), "side": "buy", "type": "market",
-             "time_in_force": "cls", "client_order_id": f"on-buy-{datetime.now():%Y%m%d}"}
+             "time_in_force": "cls", "client_order_id": f"on-buy-{datetime.now(NY):%Y%m%d}"}
     send(api, a, order, f"overnight entry, last {price}, qty {qty} (~${qty*price:.0f})")
 
 
@@ -255,7 +263,7 @@ def cmd_sell_pre(api, a):
     limit = round(limit, 2)
     order = {"symbol": a.symbol, "qty": str(qty), "side": "sell", "type": "limit",
              "limit_price": f"{limit:.2f}", "time_in_force": "day", "extended_hours": True,
-             "client_order_id": f"on-sellpre-{datetime.now():%Y%m%d%H%M}"}
+             "client_order_id": f"on-sellpre-{datetime.now(NY):%Y%m%d%H%M}"}
     send(api, a, order, why + f", entry {pos.get('avg_entry_price')}")
 
 
@@ -280,7 +288,7 @@ def cmd_sell_open(api, a):
         return log("skip_sell_open", reason="filled while cancelling")
     qty = int(float(pos["qty"]))
     order = {"symbol": a.symbol, "qty": str(qty), "side": "sell", "type": "market",
-             "time_in_force": "opg", "client_order_id": f"on-sellopg-{datetime.now():%Y%m%d}"}
+             "time_in_force": "opg", "client_order_id": f"on-sellopg-{datetime.now(NY):%Y%m%d}"}
     send(api, a, order, "fallback exit at the opening auction")
 
 
@@ -301,6 +309,107 @@ def parse_ts(ts):
     return datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
 
 
+def _ny_midnight_utc():
+    d = datetime.now(NY).replace(hour=0, minute=0, second=0, microsecond=0)
+    return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _filled(orders, side):
+    return [o for o in orders if o["side"] == side and float(o.get("filled_qty") or 0) > 0
+            and o.get("filled_at")]
+
+
+def _vwap(orders):
+    q = sum(float(o["filled_qty"]) for o in orders)
+    return q, sum(float(o["filled_qty"]) * float(o["filled_avg_price"]) for o in orders) / q
+
+
+def today_open_price(api, symbol, feed):
+    start = _ny_midnight_utc()
+    end = (datetime.now(timezone.utc) - timedelta(minutes=16)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for f in ("sip", feed):
+        try:
+            bars = api.data(f"/v2/stocks/{symbol}/bars", timeframe="1Day", start=start, end=end,
+                            adjustment="raw", feed=f).get("bars") or []
+            if bars:
+                return float(bars[0]["o"]), f
+        except RuntimeError:
+            continue
+    return None, None
+
+
+def read_compare():
+    if not os.path.exists(COMPARE_FILE):
+        return []
+    with open(COMPARE_FILE, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def cmd_compare(api, a):
+    today = datetime.now(NY).strftime("%Y-%m-%d")
+    if any(r["date"] == today for r in read_compare()):
+        return
+    sells = _filled(api.get("/v2/orders", status="closed", symbols=a.symbol, after=_ny_midnight_utc(),
+                            direction="asc", limit=100), "sell")
+    if not sells:
+        return log("compare_skip", reason="no filled sell today (holding, or not filled yet)")
+    open_px, feed = today_open_price(api, a.symbol, a.feed)
+    if open_px is None:
+        return log("compare_skip", reason="opening price not available yet (SIP data is 15 min delayed)")
+    first_fill = min(o["filled_at"] for o in sells)
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    buys = [o for o in _filled(api.get("/v2/orders", status="closed", symbols=a.symbol, after=week_ago,
+                                       direction="desc", limit=100), "buy")
+            if o["filled_at"] < first_fill]
+    qty, sell_px = _vwap(sells)
+    entry_px = float(buys[0]["filled_avg_price"]) if buys else float("nan")
+    ids = [o.get("client_order_id", "") for o in sells]
+    kind = ("pre-market" if all(i.startswith("on-sellpre") for i in ids) else
+            "open-auction" if all(i.startswith("on-sellopg") for i in ids) else "mixed/manual")
+    sell_time = parse_ts(min(o["filled_at"] for o in sells)).astimezone(NY).strftime("%H:%M:%S")
+    row = {"date": today, "exit_kind": kind, "qty": f"{qty:g}", "entry_px": f"{entry_px:.4f}",
+           "sell_px": f"{sell_px:.4f}", "sell_time_ny": sell_time, "open_px": f"{open_px:.4f}",
+           "ret_actual_pct": f"{(sell_px / entry_px - 1) * 100:.3f}",
+           "ret_if_open_pct": f"{(open_px / entry_px - 1) * 100:.3f}",
+           "diff_pct": f"{(sell_px / open_px - 1) * 100:.3f}",
+           "diff_usd": f"{qty * (sell_px - open_px):.2f}"}
+    new = not os.path.exists(COMPARE_FILE)
+    with open(COMPARE_FILE, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=COMPARE_FIELDS)
+        if new:
+            w.writeheader()
+        w.writerow(row)
+    log("compare", open_feed=feed, **row)
+
+
+def cmd_report(a):
+    rows = read_compare()
+    if not rows:
+        return print(f"No records yet in {COMPARE_FILE}.")
+    print(f"{'date':10s} {'exit':13s} {'qty':>4s} {'entry':>9s} {'sell':>9s} {'at':>8s} "
+          f"{'open':>9s} {'diff%':>7s} {'diff$':>8s}")
+    for r in rows:
+        print(f"{r['date']:10s} {r['exit_kind']:13s} {r['qty']:>4s} {float(r['entry_px']):9.2f} "
+              f"{float(r['sell_px']):9.2f} {r['sell_time_ny']:>8s} {float(r['open_px']):9.2f} "
+              f"{float(r['diff_pct']):7.2f} {float(r['diff_usd']):8.2f}")
+    for label, sub in (("all exits", rows), ("pre-market exits only",
+                                            [r for r in rows if r["exit_kind"] == "pre-market"])):
+        if not sub:
+            continue
+        d = [float(r["diff_pct"]) for r in sub]
+        n, m = len(d), sum(d) / len(d)
+        sd = (sum((x - m) ** 2 for x in d) / (n - 1)) ** 0.5 if n > 1 else float("nan")
+        t = m / (sd / n ** 0.5) if n > 1 and sd > 0 else float("nan")
+        usd = sum(float(r["diff_usd"]) for r in sub)
+        act = math.prod(1 + float(r["ret_actual_pct"]) / 100 for r in sub)
+        opn = math.prod(1 + float(r["ret_if_open_pct"]) / 100 for r in sub)
+        print(f"\n{label}: n={n}  avg diff vs open {m:+.3f}%  t={t:.2f}  "
+              f"better than open {sum(x > 0 for x in d) / n * 100:.0f}% of days  total ${usd:+.2f}")
+        print(f"  compounded: actual exits {(act - 1) * 100:+.2f}%  vs  if sold at open {(opn - 1) * 100:+.2f}%")
+    print("\nResearch expectation: about +0.24% per trade (t 2.2 over 721 nights), but ~0% in 2026. "
+          "Needs dozens of trades before the average means anything.")
+
+
 def cmd_auto(api, a):
     """Dispatch by New York time. Every step is idempotent, so cron can call this often."""
     now = datetime.now(NY)
@@ -313,11 +422,13 @@ def cmd_auto(api, a):
         cmd_sell_pre(api, a)
     elif dtime(9, 15) <= t < dtime(9, 27):
         cmd_sell_open(api, a)
+    elif dtime(9, 50) <= t < dtime(10, 10):
+        cmd_compare(api, a)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["auto", "status", "buy", "sell-pre", "sell-open", "cancel"])
+    ap.add_argument("command", choices=["auto", "status", "compare", "report", "buy", "sell-pre", "sell-open", "cancel"])
     ap.add_argument("--symbol", default="BE")
     ap.add_argument("--max-usd", type=float, default=300.0, help="max position value (default 300)")
     ap.add_argument("--slip", type=float, default=0.003,
@@ -328,8 +439,10 @@ def main():
     ap.add_argument("--live", action="store_true", help="trade real money (needs live base URL too)")
     ap.add_argument("--dry-run", action="store_true", help="print orders, do not send")
     a = ap.parse_args()
+    if a.command == "report":
+        return cmd_report(a)
     api = Alpaca(a.live)
-    {"auto": cmd_auto, "status": cmd_status, "buy": cmd_buy, "sell-pre": cmd_sell_pre,
+    {"auto": cmd_auto, "status": cmd_status, "compare": cmd_compare, "buy": cmd_buy, "sell-pre": cmd_sell_pre,
      "sell-open": cmd_sell_open, "cancel": cmd_cancel}[a.command](api, a)
 
 
