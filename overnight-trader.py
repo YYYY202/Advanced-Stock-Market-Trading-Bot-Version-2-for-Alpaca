@@ -15,7 +15,10 @@ Commands (New York time, Mon-Fri):
                               from the current New York time (safe to repeat)
   status                      account, clock, position, open orders, signal
   buy        ~15:40           market-on-close buy (must be sent before 15:50)
-  sell-pre   ~04:05 .. 09:00  extended-hours limit sell at bid - --slip
+  sell-pre   ~04:05 .. 09:00  extended-hours limit sell: bid - --slip if a fresh quote
+                              exists, never below prev close - --floor (default 2%);
+                              without a fresh quote the limit IS that floor, which
+                              still fills at the best bid above it
   sell-open  ~09:20           cancel unfilled pre-market sell, market-on-open sell
   cancel                      cancel all open orders for the symbol
 
@@ -112,11 +115,13 @@ class Alpaca:
 
 
 # ------------------------------------------------------------------ signal
-def daily_closes(api, symbol, feed):
-    start = (datetime.now(timezone.utc) - timedelta(days=200)).strftime("%Y-%m-%d")
+def _bars(api, symbol, feed):
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=200)).strftime("%Y-%m-%d")
+    end = (now - timedelta(minutes=16)).strftime("%Y-%m-%dT%H:%M:%SZ")   # free plan: SIP >15 min old
     bars, token = [], None
     while True:
-        params = dict(timeframe="1Day", start=start, adjustment="all", feed=feed, limit=1000)
+        params = dict(timeframe="1Day", start=start, end=end, adjustment="all", feed=feed, limit=1000)
         if token:
             params["page_token"] = token
         r = api.data(f"/v2/stocks/{symbol}/bars", **params)
@@ -124,6 +129,17 @@ def daily_closes(api, symbol, feed):
         token = r.get("next_page_token")
         if not token:
             break
+    return bars
+
+
+def daily_closes(api, symbol, feed):
+    """Completed daily closes (consolidated SIP if allowed, else the given feed), excluding today."""
+    try:
+        bars = _bars(api, symbol, "sip")
+    except RuntimeError:
+        bars = _bars(api, symbol, feed)
+    today = datetime.now(NY).date()
+    bars = [b for b in bars if parse_ts(b["t"]).astimezone(NY).date() < today]
     return [b["c"] for b in bars]
 
 
@@ -200,28 +216,47 @@ def holding_through_day(api, a):
     return state
 
 
+def trading_day_today(api):
+    """True if the regular session opens today (New York date)."""
+    nxt = api.get("/v2/clock").get("next_open", "")
+    try:
+        return datetime.fromisoformat(nxt).astimezone(NY).date() == datetime.now(NY).date()
+    except ValueError:
+        return False
+
+
 def cmd_sell_pre(api, a):
     pos = api.position(a.symbol)
     if not pos:
         return log("skip_sell", reason="no position")
-    if holding_through_day(api, a):
-        return
+    if not trading_day_today(api):
+        return log("skip_sell", reason="no regular session today (holiday?)")
+    closes = daily_closes(api, a.symbol, a.feed)
+    state, rsi, sma = momentum_state(closes)
+    if state:
+        return log("hold", reason="momentum state ON - keep position through the day",
+                   rsi=round(rsi, 1), sma20=round(sma, 2))
     if api.open_orders(a.symbol):
         return log("skip_sell", reason="open order already working")
     qty = int(float(pos["qty_available"] if "qty_available" in pos else pos["qty"]))
+    prev_close = closes[-1]
+    floor_px = prev_close * (1 - a.floor)
     bid, ask, ts = api.latest_quote(a.symbol, a.feed)
     age_min = (datetime.now(timezone.utc) - parse_ts(ts)).total_seconds() / 60
-    if age_min > MAX_QUOTE_AGE_MIN or bid <= 0:
-        return log("skip_sell", reason=f"quote is {age_min:.0f} min old or empty on feed '{a.feed}' "
-                   "(free IEX feed has pre-market quotes only from 08:00 NY); will retry",
-                   bid=bid, ask=ask, quote_time=ts)
-    ref = bid
-    limit = round(ref * (1 - a.slip), 2)
+    if age_min <= MAX_QUOTE_AGE_MIN and bid > 0:
+        limit = max(bid * (1 - a.slip), floor_px)
+        why = f"pre-market exit at fresh bid {bid}/{ask} ({age_min:.0f} min old)"
+    else:
+        # No fresh quote (free IEX feed starts at 08:00). A sell limit fills at the best bid
+        # at or above the limit, so a floor below the last close still sells near market.
+        limit = floor_px
+        why = (f"pre-market exit with floor {a.floor:.1%} below prev close {prev_close} "
+               f"(quote on '{a.feed}' is {age_min:.0f} min old)")
+    limit = round(limit, 2)
     order = {"symbol": a.symbol, "qty": str(qty), "side": "sell", "type": "limit",
              "limit_price": f"{limit:.2f}", "time_in_force": "day", "extended_hours": True,
              "client_order_id": f"on-sellpre-{datetime.now():%Y%m%d%H%M}"}
-    send(api, a, order, f"pre-market exit, bid {bid} ask {ask} @ {ts}, "
-                        f"entry {pos.get('avg_entry_price')}")
+    send(api, a, order, why + f", entry {pos.get('avg_entry_price')}")
 
 
 def cmd_sell_open(api, a):
@@ -287,6 +322,8 @@ def main():
     ap.add_argument("--max-usd", type=float, default=300.0, help="max position value (default 300)")
     ap.add_argument("--slip", type=float, default=0.003,
                     help="pre-market sell limit = bid * (1 - slip), default 0.3%%")
+    ap.add_argument("--floor", type=float, default=0.02,
+                    help="pre-market sell never below prev close * (1 - floor), default 2%%")
     ap.add_argument("--feed", default="iex", help="market data feed: iex (free) or sip")
     ap.add_argument("--live", action="store_true", help="trade real money (needs live base URL too)")
     ap.add_argument("--dry-run", action="store_true", help="print orders, do not send")
