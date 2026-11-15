@@ -10,7 +10,9 @@ Strategy (from the research scripts in this repo):
   * While the "momentum" state is on (RSI(14) crossed above 70; ends when
     RSI > 80 or close < SMA20) the position is kept through the day instead.
 
-Commands (run them on a schedule, New York time, Mon-Fri):
+Commands (New York time, Mon-Fri):
+  auto                        run every 5 minutes from cron; picks the step below
+                              from the current New York time (safe to repeat)
   status                      account, clock, position, open orders, signal
   buy        ~15:40           market-on-close buy (must be sent before 15:50)
   sell-pre   ~04:05 .. 09:00  extended-hours limit sell at bid - --slip
@@ -36,13 +38,16 @@ import json
 import math
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
 PAPER_URL = "https://paper-api.alpaca.markets"
 LIVE_URL = "https://api.alpaca.markets"
 DATA_URL = "https://data.alpaca.markets"
+NY = ZoneInfo("America/New_York")
+MAX_QUOTE_AGE_MIN = 15
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "overnight-trader-log.jsonl")
 
 
@@ -205,7 +210,12 @@ def cmd_sell_pre(api, a):
         return log("skip_sell", reason="open order already working")
     qty = int(float(pos["qty_available"] if "qty_available" in pos else pos["qty"]))
     bid, ask, ts = api.latest_quote(a.symbol, a.feed)
-    ref = bid if bid > 0 else api.latest_trade(a.symbol, a.feed)[0]
+    age_min = (datetime.now(timezone.utc) - parse_ts(ts)).total_seconds() / 60
+    if age_min > MAX_QUOTE_AGE_MIN or bid <= 0:
+        return log("skip_sell", reason=f"quote is {age_min:.0f} min old or empty on feed '{a.feed}' "
+                   "(free IEX feed has pre-market quotes only from 08:00 NY); will retry",
+                   bid=bid, ask=ask, quote_time=ts)
+    ref = bid
     limit = round(ref * (1 - a.slip), 2)
     order = {"symbol": a.symbol, "qty": str(qty), "side": "sell", "type": "limit",
              "limit_price": f"{limit:.2f}", "time_in_force": "day", "extended_hours": True,
@@ -220,7 +230,10 @@ def cmd_sell_open(api, a):
         return log("skip_sell_open", reason="no position (pre-market sell filled?)")
     if holding_through_day(api, a):
         return
-    for o in api.open_orders(a.symbol):
+    orders = api.open_orders(a.symbol)
+    if any(o["side"] == "sell" and o["time_in_force"] == "opg" for o in orders):
+        return log("skip_sell_open", reason="opening-auction sell already queued")
+    for o in orders:
         if o["side"] == "sell":
             if a.dry_run:
                 log("dry_run_cancel", id=o["id"])
@@ -245,9 +258,31 @@ def cmd_cancel(api, a):
             log("cancelled", id=o["id"])
 
 
+def parse_ts(ts):
+    ts = ts.rstrip("Z")
+    if "." in ts:
+        head, frac = ts.split(".", 1)
+        ts = f"{head}.{frac[:6]}"
+    return datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
+
+
+def cmd_auto(api, a):
+    """Dispatch by New York time. Every step is idempotent, so cron can call this often."""
+    now = datetime.now(NY)
+    if now.weekday() >= 5:
+        return
+    t = now.time()
+    if dtime(15, 35) <= t < dtime(15, 49):
+        cmd_buy(api, a)
+    elif dtime(4, 5) <= t < dtime(9, 10):
+        cmd_sell_pre(api, a)
+    elif dtime(9, 15) <= t < dtime(9, 27):
+        cmd_sell_open(api, a)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["status", "buy", "sell-pre", "sell-open", "cancel"])
+    ap.add_argument("command", choices=["auto", "status", "buy", "sell-pre", "sell-open", "cancel"])
     ap.add_argument("--symbol", default="BE")
     ap.add_argument("--max-usd", type=float, default=300.0, help="max position value (default 300)")
     ap.add_argument("--slip", type=float, default=0.003,
@@ -257,7 +292,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print orders, do not send")
     a = ap.parse_args()
     api = Alpaca(a.live)
-    {"status": cmd_status, "buy": cmd_buy, "sell-pre": cmd_sell_pre,
+    {"auto": cmd_auto, "status": cmd_status, "buy": cmd_buy, "sell-pre": cmd_sell_pre,
      "sell-open": cmd_sell_open, "cancel": cmd_cancel}[a.command](api, a)
 
 

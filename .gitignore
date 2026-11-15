@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
 overnight-trader-log.jsonl
+overnight-trader-cron.log
